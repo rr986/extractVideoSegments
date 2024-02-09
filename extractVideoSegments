@@ -1,0 +1,109 @@
+onst { RekognitionClient, StartLabelDetectionCommand, GetLabelDetectionCommand } = require("@aws-sdk/client-rekognition");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { execSync } = require('child_process');
+
+exports.handler = async (event) => {
+    const rekognitionClient = new RekognitionClient({ region: "us-east-2" });
+    const s3Client = new S3Client({ region: "us-east-2" });
+    const body = JSON.parse(event.body);
+    const videoPath = body.videoPath;
+
+    try {
+        const startCommand = new StartLabelDetectionCommand({
+            Video: {
+                S3Object: {
+                    Bucket: 'digistreambucket',
+                    Name: videoPath
+                }
+            },
+            MinConfidence: 30
+        });
+        const startResponse = await rekognitionClient.send(startCommand);
+        const jobId = startResponse.JobId;
+
+        let jobStatus = 'IN_PROGRESS';
+        let rekognitionResult;
+
+        while (jobStatus === 'IN_PROGRESS') {
+            await new Promise(resolve => setTimeout(resolve, 5000));
+
+            const statusCommand = new GetLabelDetectionCommand({ JobId: jobId });
+            const statusResponse = await rekognitionClient.send(statusCommand);
+            jobStatus = statusResponse.JobStatus;
+
+            if (jobStatus === 'SUCCEEDED') {
+                rekognitionResult = statusResponse.Labels;
+                break;
+            } else if (jobStatus === 'FAILED') {
+                throw new Error('Rekognition job failed');
+            }
+        }
+
+        // Process labels to determine segments
+        let segments = processLabels(rekognitionResult);
+
+        // Extract segments and compile into a single video
+        let inputOptions = '';
+        let filterOptions = '';
+        segments.forEach((segment, index) => {
+            inputOptions += `-i 's3://digistreambucket/${videoPath}' `;
+            filterOptions += `[0:v]trim=start=${segment.startTime}:end=${segment.endTime},setpts=PTS-STARTPTS[v${index}];`;
+        });
+        let concatFilter = '';
+        for (let i = 0; i < segments.length; i++) {
+            concatFilter += `[v${i}]`;
+        }
+        concatFilter += `concat=n=${segments.length}:v=1[outv]`;
+        filterOptions += concatFilter;
+
+        const command = `ffmpeg ${inputOptions} ${filterOptions} -map [outv] -c:v copy output.mp4`;
+        execSync(command);
+
+        // Upload the output file to S3
+        const output = execSync('cat output.mp4');
+        const putObjectCommand = new PutObjectCommand({
+            Bucket: 'digistreambucket',
+            Key: 'compiled_video/output.mp4',
+            Body: output
+        });
+        await s3Client.send(putObjectCommand);
+
+        return {
+            statusCode: 200,
+            headers: {
+                "Access-Control-Allow-Origin": "*", // Or specify your domain
+                "Access-Control-Allow-Credentials": true
+            },
+            body: JSON.stringify({ message: 'Video processing completed' })
+        };
+    } catch (error) {
+        console.error('Error:', error);
+        return {
+            statusCode: 500,
+            headers: {
+                "Access-Control-Allow-Origin": "*", // Or specify your domain
+                "Access-Control-Allow-Credentials": true
+            },
+            body: JSON.stringify({ error: 'Internal server error' })
+        };
+    }
+};
+
+function processLabels(labels) {
+    let segments = [];
+    const duration = 10000; // Duration for each segment in milliseconds, e.g., 10000 ms (10 seconds)
+
+    labels.forEach(label => {
+        if (label.Label.Name === 'DesiredLabelName') {
+            let startTime = label.Timestamp;
+            let endTime = startTime + duration; // Set end time as a fixed duration from the start
+
+            segments.push({
+                startTime: startTime,
+                endTime: endTime,
+                index: segments.length
+            });
+        }
+    });
+    return segments;
+}
